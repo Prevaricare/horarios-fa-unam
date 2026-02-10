@@ -82,24 +82,195 @@ def consultar_api(endpoint, payload_extra):
     except Exception as e:
         st.error(f"Error de conexión: {e}")
         return None
-
 # ==========================================
-# 4. PARSER INTELIGENTE
+# AGREGAR ESTO EN LA SECCIÓN 3
+# ==========================================
+
+@st.cache_data(show_spinner=False) # Guardamos en caché para no cargarla cada vez
+def obtener_catalogo_profesores():
+    """
+    Descarga la lista completa de profesores directamente desde el sitio web.
+    Busca el elemento <select id="idprof"> mostrado en tu imagen.
+    """
+    url = f"{URL_BASE}/index.php" # Generalmente la lista está en el inicio
+    
+    try:
+        # Hacemos una petición GET normal para ver el formulario
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, "lxml")
+        
+        # Buscamos el dropdown por su ID (visto en tu imagen)
+        select_profes = soup.find("select", {"id": "idprof"})
+        
+        if not select_profes:
+            return {} # Si no lo encuentra, regresa vacío
+
+        profesores = {}
+        # Iteramos sobre cada <option> dentro del select
+        for option in select_profes.find_all("option"):
+            valor = option.get("value")
+            texto = option.get_text(strip=True)
+            
+            # Filtramos la opción por defecto "--PROFESOR--" y valores vacíos
+            if valor and "PROFESOR" not in valor and len(valor) > 2:
+                profesores[texto] = valor
+                
+        return profesores
+
+    except Exception as e:
+        st.error(f"No se pudo cargar la lista de profesores: {e}")
+        return {}
+# ==========================================
+# 4. PARSER INTELIGENTE Y VISUALIZADOR
 # ==========================================
 
 def limpiar_texto(texto):
-    """Limpia espacios, saltos de línea y el símbolo '+' de los profesores."""
     if not texto: return ""
     return texto.strip().replace("+ ", "").replace("\n", " ").replace("\r", "")
 
 def extraer_horario(celda_html):
-    """Busca las etiquetas <b> donde suele estar el horario."""
     etiquetas_b = celda_html.find_all("b")
     if not etiquetas_b:
-        return celda_html.get_text(strip=True) # Fallback
+        return celda_html.get_text(strip=True)
     return " / ".join([b.get_text(strip=True) for b in etiquetas_b])
 
+def interpretar_horario(texto_horario):
+    """
+    Parser robusto para horarios complejos.
+    Corrige el error de 'comerse' las comas y juntar días.
+    """
+    if not texto_horario: return []
+    
+    # 1. Normalización: Minúsculas
+    texto = texto_horario.lower()
+    
+    # 2. LIMPIEZA CRÍTICA: Reemplazar separadores por ESPACIOS
+    # El error anterior era reemplazarlos por "" (nada), lo que pegaba "14:00,MI" -> "14:00mi"
+    for char in [",", ";", ".", " y ", " e ", " - "]: 
+        texto = texto.replace(char, " ")
+        
+    # 3. Quitar los dos puntos SOLO de las horas (10:00 -> 1000)
+    texto = texto.replace(":", "")
+    
+    # Mapa de días
+    mapa_dias = {
+        "lu": "Lunes", "ma": "Martes", "mi": "Miércoles", 
+        "ju": "Jueves", "vi": "Viernes", "sa": "Sábado"
+    }
+    
+    bloques = []
+    tokens = texto.split() # Dividir por espacios
+    
+    dias_activos = [] # Memoria de qué días estamos leyendo
+    
+    for token in tokens:
+        token = token.strip()
+        if not token: continue
+
+        # A) ¿Es un día? (ej: "lu", "ma")
+        # Tomamos las primeras 2 letras por si viene "lunes" completo
+        token_clean = token[:2] 
+        if token_clean in mapa_dias:
+            # Encontramos un nuevo día, actualizamos el "puntero"
+            dias_activos = [mapa_dias[token_clean]]
+            
+        # B) ¿Es un horario? (ej: "0900-1400" o "9-14")
+        elif "-" in token:
+            horas = re.findall(r'(\d{1,4})-(\d{1,4})', token)
+            if horas and dias_activos:
+                inicio_raw, fin_raw = horas[0]
+                
+                # Función auxiliar para convertir hora texto a numero decimal
+                def normalizar_hora(h_str):
+                    val = int(h_str)
+                    # Caso formato militar 1330 -> 13.5
+                    if val > 24: 
+                        horas = val // 100
+                        minutos = val % 100
+                        return horas + (0.5 if minutos >= 30 else 0)
+                    # Caso formato simple 13 -> 13.0
+                    return float(val) 
+                
+                inicio = normalizar_hora(inicio_raw)
+                fin = normalizar_hora(fin_raw)
+                
+                # Agregar este horario a TODOS los días activos (ej: MI 7-12 y 13-15)
+                for dia in dias_activos:
+                    bloques.append({
+                        "dia": dia,
+                        "inicio": int(inicio), # Redondeamos a entero para el grid
+                        "fin": int(fin) + (1 if fin % 1 > 0 else 0) # Asegurar que cubra la hora final
+                    })
+    
+    return bloques
+
+def generar_paleta_colores(n):
+    """Genera una lista de colores pastel bonitos"""
+    colores_base = [
+        "#FFB3BA", "#FFDFBA", "#FFFFBA", "#BAFFC9", "#BAE1FF", # Pastel Red, Orange, Yellow, Green, Blue
+        "#E6B3FF", "#F0E68C", "#98FB98", "#DDA0DD", "#87CEFA"  # Purple, Khaki, PaleGreen, Plum, LightSkyBlue
+    ]
+    return colores_base * (n // len(colores_base) + 1)
+
+def crear_grid_horario(lista_materias):
+    """
+    Genera dos DataFrames: Texto (visual) y Colores (fondo)
+    """
+    dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
+    horas = range(7, 22) # 7am a 10pm
+    
+    df_texto = pd.DataFrame("", index=horas, columns=dias)
+    df_colores = pd.DataFrame("", index=horas, columns=dias)
+    
+    conflictos = []
+    
+    # Generamos colores pastel
+    paleta = generar_paleta_colores(len(lista_materias))
+    mapa_colores = {m['id']: paleta[i] for i, m in enumerate(lista_materias)}
+
+    for materia in lista_materias:
+        bloques = interpretar_horario(materia["Horario"])
+        
+        # Formato corto para que no ocupe tanto espacio
+        nombre_display = f"{materia['Materia']}\n(G:{materia['Grupo']})"
+        color = mapa_colores[materia['id']]
+        
+        for bloque in bloques:
+            dia = bloque["dia"]
+            h_inicio = bloque["inicio"]
+            h_fin = bloque["fin"]
+            
+            # Iteramos sobre las horas del bloque
+            for h in range(h_inicio, h_fin):
+                if h in df_texto.index:
+                    # VERIFICAR CONFLICTOS
+                    # Si la celda ya tiene color, hay choque (a menos que sea la misma materia)
+                    color_actual = df_colores.at[h, dia]
+                    if color_actual and color_actual != color:
+                        conflictos.append(f"Choque en {dia} a las {h}:00")
+                        df_colores.at[h, dia] = "#ff4b4b" # Rojo intenso
+                        df_texto.at[h, dia] = "⚠️ CHOQUE"
+                    else:
+                        # PINTAR
+                        df_colores.at[h, dia] = color
+                        
+                        # LOGICA VISUAL: Solo poner texto en la primera hora
+                        if h == h_inicio:
+                            df_texto.at[h, dia] = nombre_display
+                        # Las demás horas se quedan con texto vacío "" pero con fondo de color
+                        
+    return df_texto, df_colores, conflictos
+
+# ==========================================
+# AGREGAR ESTO AL FINAL DE LA SECCIÓN 4
+# ==========================================
+
 def parsear_html_generico(html, tipo_parseo="ESTANDAR"):
+    """
+    Parsea el HTML devuelto por el servidor y lo convierte en DataFrame.
+    """
     soup = BeautifulSoup(html, "lxml")
     
     tablas = soup.find_all("table")
@@ -115,7 +286,7 @@ def parsear_html_generico(html, tipo_parseo="ESTANDAR"):
     contexto_actual = "General"
     turno_actual = "Indistinto"
 
-    # Mapa de colores (OJO: BeautifulSoup a veces normaliza los estilos, así que buscamos substring)
+    # Mapa de colores para detectar turno
     COLORES_TURNO = {
         "64C2FD": "Matutino",   # Azul
         "FFA97C": "Vespertino"  # Naranja
@@ -128,43 +299,29 @@ def parsear_html_generico(html, tipo_parseo="ESTANDAR"):
         # ---------------------------------------------------------
         # 1. DETECCIÓN DE SEPARADORES (Encabezados)
         # ---------------------------------------------------------
-        # Las filas separadoras NO tienen la clase 'sombreado'
         if not fila.get("class") or "sombreado" not in fila.get("class"):
-            
-            # Verificamos si es una celda ancha (típico de encabezados)
             celda_header = celdas[0]
             if celda_header.get("colspan"):
-                
-                # --- CORRECCIÓN AQUÍ: Leemos el estilo de la CELDA, no de la fila ---
                 estilo_celda = celda_header.get("style", "").upper()
                 texto_separador = celda_header.get_text(strip=True)
 
                 # A) DETECTAR TURNO POR COLOR
-                # Buscamos el código de color dentro del estilo de la celda
-                encontro_color = False
                 for hex_code, nombre_turno in COLORES_TURNO.items():
                     if hex_code in estilo_celda:
                         turno_actual = nombre_turno
-                        encontro_color = True
                         break
                 
-                # Si no encontró color (ej. encabezados amarillos de "Semestre"), 
-                # mantenemos el turno anterior o lo reseteamos si es un cambio mayor.
-                # En este caso, solo actualizamos turno si encontramos color explícito.
-
-                # B) ACTUALIZAR CONTEXTO (Nombre del Taller)
+                # B) ACTUALIZAR CONTEXTO (Nombre del Taller/LIP)
                 if texto_separador:
                     if "Taller:" in texto_separador:
                         contexto_actual = texto_separador.replace("Taller:", "").strip()
                     elif "Cursos Optativos" in texto_separador:
                         contexto_actual = texto_separador.replace("Cursos Optativos Área", "").strip()
-                        turno_actual = "Indistinto" # Las optativas no suelen tener turno fijo por color aquí
+                        turno_actual = "Indistinto"
                     elif "LIP:" in texto_separador:
-                         # A veces el LIP viene aquí
                          if "LIP:" in texto_separador:
                              contexto_actual = texto_separador.split("LIP:")[1].strip()
-
-            continue # Pasamos a la siguiente fila
+            continue
 
         # ---------------------------------------------------------
         # 2. EXTRACCIÓN DE DATOS (Filas 'sombreado')
@@ -174,13 +331,11 @@ def parsear_html_generico(html, tipo_parseo="ESTANDAR"):
             
             item = {}
             
-            # --- PARSEO ESTÁNDAR / TALLER ---
             if tipo_parseo in ["ESTANDAR", "ASIGNATURA_CONTEXTO"]:
                 item["Clave"] = limpiar_texto(celdas[0].text)
                 
                 raw_materia = celdas[1].text
                 if "LIP:" in raw_materia:
-                    # Limpiamos el texto sucio del LIP dentro de la materia
                     item["Materia"] = limpiar_texto(raw_materia.split("LIP:")[0])
                 else:
                     item["Materia"] = limpiar_texto(raw_materia)
@@ -195,7 +350,6 @@ def parsear_html_generico(html, tipo_parseo="ESTANDAR"):
                 item["Agrupación"] = contexto_actual 
                 item["Turno"] = turno_actual 
 
-            # --- PARSEO PROFESOR ---
             elif tipo_parseo == "PROFESOR":
                 item["Clave"] = limpiar_texto(celdas[0].text)
                 item["Materia"] = limpiar_texto(celdas[1].text)
@@ -205,7 +359,6 @@ def parsear_html_generico(html, tipo_parseo="ESTANDAR"):
                 item["Horario"] = extraer_horario(celdas[5])
                 item["Turno"] = "ND" 
 
-            # --- PARSEO GÉNERO ---
             elif tipo_parseo == "GENERO":
                 item["Clave"] = limpiar_texto(celdas[0].text)
                 item["Materia"] = limpiar_texto(celdas[1].text)
@@ -225,6 +378,9 @@ def parsear_html_generico(html, tipo_parseo="ESTANDAR"):
 # ==========================================
 
 st.set_page_config(page_title="UNAM Arq Scheduler", layout="wide", page_icon="🏛️")
+# --- INICIALIZAR MOCHILA DE MATERIAS ---
+if 'mi_horario' not in st.session_state:
+    st.session_state.mi_horario = [] # Aquí guardaremos las materias
 
 # --- CSS para mejorar apariencia ---
 st.markdown("""
@@ -241,6 +397,7 @@ with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/c/ca/Escudo-UNAM-escalable.svg/1024px-Escudo-UNAM-escalable.svg.png", width=100)
     st.title("Buscador de Horarios")
     st.markdown("---")
+    # ... (Dentro del sidebar)
     modo_busqueda = st.radio(
         "Selecciona modo:",
         ["Taller / Semestre", "Optativas", "Complementarios", "Asignatura", "Requisito de Género", "Profesor"]
@@ -250,7 +407,10 @@ with st.sidebar:
 # --- ÁREA PRINCIPAL ---
 st.header(f"🏛️ Búsqueda por: {modo_busqueda}")
 
-df_resultado = pd.DataFrame()
+# 1. INICIALIZAR LA MEMORIA DE BÚSQUEDA
+# Si no existe un lugar para guardar los resultados, lo creamos vacío
+if 'resultados_busqueda' not in st.session_state:
+    st.session_state.resultados_busqueda = pd.DataFrame()
 
 # ==========================================
 # LÓGICA POR MODO DE BÚSQUEDA
@@ -261,94 +421,221 @@ if modo_busqueda == "Taller / Semestre":
     with col1:
         taller_nom = st.selectbox("Selecciona Taller", list(CATALOGOS["TALLERES"].keys()))
     with col2:
-        # Nota: El semestre 0 también existe para ver TODOS los semestres de un taller
         semestre = st.selectbox("Semestre", [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], index=1)
         if semestre == 0: st.caption("Mostrando todos los semestres")
     
     if st.button("Buscar"):
-        # Llamada normal, el ID 0 de "TODOS" se maneja solo
         html = consultar_api("taller.php", {"tal": CATALOGOS["TALLERES"][taller_nom], "talsem": semestre})
-        
         if html:
-            # Usamos el parser ESTANDAR, que ahora captura la "Agrupación" (Nombre del Taller o Semestre)
-            df_resultado = parsear_html_generico(html, "ESTANDAR")
+            # GUARDAR EN SESSION_STATE
+            st.session_state.resultados_busqueda = parsear_html_generico(html, "ESTANDAR")
+        else:
+            st.warning("No se encontraron datos.")
 
 elif modo_busqueda == "Optativas":
     tipo_opt = st.radio("Filtrar por:", ["Área de Conocimiento", "Línea de Interés (LIP)"], horizontal=True)
-    
-    tal_fijo = 19 # Siempre es 19 para optativas
+    tal_fijo = 19
     val_select = 0
-    
+    endpoint = ""
+
     if tipo_opt == "Área de Conocimiento":
         area = st.selectbox("Selecciona Área", list(CATALOGOS["AREAS_OPTATIVAS"].keys()))
         val_select = CATALOGOS["AREAS_OPTATIVAS"][area]
-        endpoint = "taller.php" # Usa taller.php
+        endpoint = "taller.php"
     else:
         lip = st.selectbox("Selecciona LIP", list(CATALOGOS["LIPS"].keys()))
         val_select = CATALOGOS["LIPS"][lip]
-        endpoint = "LipHorarios.php" # Usa endpoint distinto
+        endpoint = "LipHorarios.php"
 
     if st.button("Buscar Optativas"):
         html = consultar_api(endpoint, {"tal": tal_fijo, "talsem": val_select})
         if html:
-            df_resultado = parsear_html_generico(html, "ESTANDAR")
+            # GUARDAR EN SESSION_STATE
+            st.session_state.resultados_busqueda = parsear_html_generico(html, "ESTANDAR")
 
 elif modo_busqueda == "Complementarios":
     semestre_comp = st.slider("Semestre", 1, 10, 1)
     if st.button("Buscar Complementarios"):
-        # Taller fijo 18 para complementarios
         html = consultar_api("taller.php", {"tal": 18, "talsem": semestre_comp})
         if html:
-            df_resultado = parsear_html_generico(html, "ESTANDAR")
+            # GUARDAR EN SESSION_STATE
+            st.session_state.resultados_busqueda = parsear_html_generico(html, "ESTANDAR")
 
 elif modo_busqueda == "Asignatura":
-    # Nota: Aquí deberíamos tener un input de texto con autocompletado si tuviéramos todas las materias
     asig_nom = st.selectbox("Selecciona Asignatura (Ejemplo)", list(CATALOGOS["ASIGNATURAS_COMUNES"].keys()))
     asig_id = CATALOGOS["ASIGNATURAS_COMUNES"][asig_nom]
     
     if st.button("Buscar por Materia"):
         html = consultar_api("asignatura.php", {"asig": asig_id})
         if html:
-            # Usamos el parser especial con contexto
-            df_resultado = parsear_html_generico(html, "ASIGNATURA_CONTEXTO")
+            # GUARDAR EN SESSION_STATE
+            st.session_state.resultados_busqueda = parsear_html_generico(html, "ASIGNATURA_CONTEXTO")
 
 elif modo_busqueda == "Requisito de Género":
     st.markdown("Busca los grupos disponibles para el requisito de género.")
     if st.button("Consultar Grupos"):
-        # Parámetros fijos observados en el código fuente
         html = consultar_api("genero.php", {"tal": 18, "talsem": 20})
         if html:
-            df_resultado = parsear_html_generico(html, "GENERO")
+            # GUARDAR EN SESSION_STATE
+            st.session_state.resultados_busqueda = parsear_html_generico(html, "GENERO")
 
 elif modo_busqueda == "Profesor":
-    # Nota: Igual que asignatura, requiere un catálogo completo o un buscador de texto
-    prof_nom = st.selectbox("Selecciona Profesor (Ejemplo)", list(CATALOGOS["PROFESORES_EJEMPLO"].keys()))
-    prof_id = CATALOGOS["PROFESORES_EJEMPLO"][prof_nom]
+    # 1. Cargamos la lista completa (solo tarda un poco la primera vez)
+    with st.spinner("Cargando catálogo completo de profesores..."):
+        catalogo_profes = obtener_catalogo_profesores()
     
-    if st.button("Ver Horario del Profesor"):
-        html = consultar_api("profe.php", {"idprof": prof_id})
-        if html:
-            df_resultado = parsear_html_generico(html, "PROFESOR")
-
+    if catalogo_profes:
+        # 2. Creamos el selector con la lista descargada
+        # Usamos orden alfabético para facilitar la búsqueda
+        nombres_ordenados = sorted(list(catalogo_profes.keys()))
+        
+        prof_nom = st.selectbox(
+            "Selecciona Profesor", 
+            nombres_ordenados,
+            index=None, # Deja el campo vacío al principio
+            placeholder="Escribe el nombre del profesor..."
+        )
+        
+        if prof_nom: # Solo si el usuario seleccionó algo
+            prof_id = catalogo_profes[prof_nom]
+            
+            if st.button("Ver Horario del Profesor"):
+                html = consultar_api("profe.php", {"idprof": prof_id})
+                if html:
+                    st.session_state.resultados_busqueda = parsear_html_generico(html, "PROFESOR")
+    else:
+        st.warning("No se pudo descargar la lista de profesores. Intenta recargar la página.")
+        
 # ==========================================
-# 6. RESULTADOS
+# 6. RESULTADOS Y SELECCIÓN (MODO VERTICAL)
 # ==========================================
 
 st.markdown("---")
 
+# 1. RECUPERAR DE LA MEMORIA
+# Importante para que no se borre la tabla al dar click
+if 'resultados_busqueda' not in st.session_state:
+    st.session_state.resultados_busqueda = pd.DataFrame()
+
+df_resultado = st.session_state.resultados_busqueda
+
+# ---------------------------------------------------------
+# PARTE SUPERIOR: RESULTADOS DE BÚSQUEDA
+# ---------------------------------------------------------
+st.subheader("📋 Resultados de la Búsqueda")
+
 if not df_resultado.empty:
-    st.success(f"✅ Se encontraron {len(df_resultado)} registros.")
+    # Añadimos columna de selección
+    # Usamos .copy() para evitar advertencias de pandas
+    df_resultado = df_resultado.copy()
+    if "Seleccionar" not in df_resultado.columns:
+        df_resultado.insert(0, "Seleccionar", False)
     
-    # AÑADÍ "Turno" y "Agrupación" a la lista de columnas
-    cols_order = ["Clave", "Materia", "Agrupación", "Turno", "Grupo", "Horario", "Profesor"]
-    
-    # Filtramos para mostrar solo las columnas que existan en el dataframe
-    cols_final = [c for c in cols_order if c in df_resultado.columns]
-    
-    st.dataframe(
-        df_resultado[cols_final], 
-        use_container_width=True,
-        hide_index=True
+    # Configuramos columnas visibles
+    columnas_visibles = ["Seleccionar", "Materia", "Grupo", "Horario", "Profesor", "Turno"]
+    cols_final = [c for c in columnas_visibles if c in df_resultado.columns]
+
+    # Tabla editable (ocupa todo el ancho disponible)
+    df_editado = st.data_editor(
+        df_resultado[cols_final],
+        hide_index=True,
+        width="stretch",  # <--- PONER ESTA NUEVA LÍNEA
+        key="editor_resultados"
     )
+    # Botón de agregar
+    if st.button("➕ Agregar seleccionadas a Mi Horario", type="primary"):
+        materias_a_agregar = df_editado[df_editado["Seleccionar"] == True]
+        
+        if not materias_a_agregar.empty:
+            count_nuevas = 0
+            for index, row in materias_a_agregar.iterrows():
+                id_unico = f"{row['Materia']}-{row['Grupo']}"
+                
+                # Verificar duplicados
+                existe = any(m['id'] == id_unico for m in st.session_state.mi_horario)
+                
+                if not existe:
+                    st.session_state.mi_horario.append({
+                        "id": id_unico,
+                        "Materia": row["Materia"],
+                        "Grupo": row["Grupo"],
+                        "Horario": row.get("Horario", ""),
+                        "Profesor": row.get("Profesor", "")
+                    })
+                    count_nuevas += 1
+            
+            if count_nuevas > 0:
+                st.success(f"✅ Se agregaron {count_nuevas} materias.")
+                st.rerun()
+            else:
+                st.warning("⚠️ Esas materias ya estaban en tu horario.")
+        else:
+            st.warning("⚠️ Selecciona primero la casilla de alguna materia.")
 else:
-    st.info("Esperando búsqueda o no se encontraron resultados.")
+    st.info("🔍 Realiza una búsqueda arriba para ver opciones disponibles.")
+
+# ---------------------------------------------------------
+# SEPARADOR VISUAL
+# ---------------------------------------------------------
+st.markdown("---")
+
+# ---------------------------------------------------------
+# PARTE INFERIOR: TU HORARIO ARMADO
+# ---------------------------------------------------------
+st.subheader("📅 Tu Horario Armado")
+
+if len(st.session_state.mi_horario) > 0:
+    # 1. Lista de materias (ahora en un expander para ahorrar espacio si son muchas)
+    with st.expander("Ver lista de materias agregadas y eliminar", expanded=False):
+        for i, materia in enumerate(st.session_state.mi_horario):
+            c1, c2 = st.columns([0.9, 0.1])
+            c1.text(f"• {materia['Materia']} (Grupo: {materia['Grupo']})")
+            if c2.button("🗑️", key=f"del_{i}"):
+                st.session_state.mi_horario.pop(i)
+                st.rerun()
+
+    # 2. Generar Grid Visual y Colores
+    grid_texto, grid_colores, conflictos = crear_grid_horario(st.session_state.mi_horario)
+    
+    if conflictos:
+        for conf in set(conflictos): 
+            st.error(f"⛔ {conf}")
+    
+    # --- FUNCIÓN DE ESTILO MEJORADA ---
+    def aplicar_estilos(df_val):
+        """
+        Aplica estilos CSS a todo el dataframe basado en grid_colores
+        """
+        # df_val es el dataframe de textos. No lo usamos, usamos grid_colores por índice
+        df_styles = pd.DataFrame('', index=df_val.index, columns=df_val.columns)
+        
+        for col in df_val.columns:
+            for idx in df_val.index:
+                color_bg = grid_colores.at[idx, col]
+                
+                if color_bg:
+                    # Estilo Base: Fondo de color + Texto Negro
+                    estilo = f'background-color: {color_bg}; color: #000000;'
+                    
+                    # Truco visual: Bordes
+                    # Si hay texto en esta celda, es el inicio del bloque -> Borde superior blanco
+                    if df_val.at[idx, col] != "":
+                        estilo += 'border-top: 2px solid white; vertical-align: top; font-weight: bold; font-size: 12px;'
+                    else:
+                        # Si no hay texto, es continuación -> Sin bordes internos para que parezca unido
+                        estilo += 'border-top: none; color: transparent;' 
+                    
+                    df_styles.at[idx, col] = estilo
+                    
+        return df_styles
+
+    # Mostrar la tabla
+    st.markdown("### Vista Semanal")
+    st.dataframe(
+        grid_texto.style.apply(aplicar_estilos, axis=None),
+        width="stretch",
+        height=700 
+    )
+    
+else:
+    st.caption("Tu horario está vacío. Busca materias arriba y agrégalas con el botón ➕.")
